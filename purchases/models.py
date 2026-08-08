@@ -375,8 +375,9 @@ class PurchaseOrder(models.Model):
 
 # purchases/models.py - Modèle PurchaseOrderItem COMPLET
 # purchases/models.py - Modèle PurchaseOrderItem COMPLET
-# purchases/models.py - Remplacez votre modèle PurchaseOrderItem par celui-ci
+#
 
+# purchases/models.py - PurchaseReceipt COMPLET
 
 class PurchaseReceipt(models.Model):
     """Réceptions de commandes"""
@@ -395,7 +396,24 @@ class PurchaseReceipt(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     # ============================================================
-    # DESTINATION DU DÉCAISSEMENT (AVEC CHAÎNES)
+    # ✅ CHAMPS POUR LA FACTURE AUTO (COMME SODEPCI)
+    # ============================================================
+    auto_invoice = models.BooleanField(
+        default=True,
+        verbose_name="Créer facture automatiquement"
+    )
+    is_invoiced = models.BooleanField(
+        default=False,
+        verbose_name="Facturée"
+    )
+    auto_invoice_number = models.CharField(
+        max_length=100,
+        blank=True,
+        verbose_name="N° Facture auto"
+    )
+
+    # ============================================================
+    # DESTINATION DU DÉCAISSEMENT
     # ============================================================
     caisse_destination = models.ForeignKey(
         'tresorerie.Caisse',
@@ -428,38 +446,52 @@ class PurchaseReceipt(models.Model):
     def __str__(self):
         return f"REC-{self.receipt_number}"
 
+    # ============================================================
+    # ✅ PROPRIÉTÉ total_received_amount (COMME SODEPCI)
+    # ============================================================
+
+    @property
+    def total_received_amount(self):
+        """Calcule le montant total reçu à partir des items"""
+        from decimal import Decimal
+        total = Decimal('0')
+        for item in self.items.all():
+            if item.order_item:
+                total += item.order_item.unit_price * item.quantity
+        return total
+
+    @property
+    def total_received_quantity(self):
+        """Quantité totale reçue"""
+        return sum(item.quantity or 0 for item in self.items.all())
+
+    @property
+    def items_count(self):
+        """Nombre d'articles"""
+        return self.items.count()
+
     def creer_mouvement_decaissement(self, user):
-        """
-        Crée un mouvement de trésorerie pour le décaissement lié à cette réception.
-        Retourne le mouvement créé ou None.
-        """
-        # Si déjà un mouvement, on ne recrée pas
+        """Crée un mouvement de trésorerie pour le décaissement"""
         if self.mouvement_tresorerie:
             return self.mouvement_tresorerie
 
-        # Récupérer le montant total de la commande (ou des produits reçus)
-        # On utilise le total de la commande (TTC)
-        montant = self.purchase_order.total
+        montant = self.total_received_amount
         if montant <= 0:
             return None
 
-        # Déterminer la destination
         caisse = self.caisse_destination
         compte = self.compte_destination
 
-        # Fallback : caisse par défaut de l'agence
         if not caisse and not compte:
             agence = self.purchase_order.agence
             if agence:
-                from tresorerie.models import Caisse  # import local
+                from tresorerie.models import Caisse
                 caisse = Caisse.objects.filter(
                     agence=agence, is_default=True).first()
             if not caisse:
-                # Si aucune caisse par défaut, on ne crée pas le mouvement
                 return None
 
-        # Créer le mouvement de décaissement
-        from tresorerie.models import MouvementTresorerie  # import local
+        from tresorerie.models import MouvementTresorerie
         mouvement = MouvementTresorerie.objects.create(
             type_mouvement='decaissement',
             agence=self.purchase_order.agence,
@@ -467,29 +499,24 @@ class PurchaseReceipt(models.Model):
             source_id=self.purchase_order.id,
             source_reference=self.purchase_order.order_number,
             montant=montant,
-            mode_paiement='virement',  # valeur par défaut, à adapter
+            mode_paiement='virement',
             caisse=caisse,
             compte_bancaire=compte,
             date_mouvement=timezone.now(),
             date_valeur=self.receipt_date,
             status='effectue',
-            libelle=f"Décaissement pour réception {self.receipt_number} - commande {self.purchase_order.order_number}",
+            libelle=f"Décaissement pour réception {self.receipt_number}",
             created_by=user
         )
-        # Le mouvement est sauvegardé et le solde est diminué automatiquement
         self.mouvement_tresorerie = mouvement
         self.save(update_fields=['mouvement_tresorerie'])
         return mouvement
 
-
-
-# purchases/models.py - CORRIGEZ cette méthode
-
 class PurchaseReceiptItem(models.Model):
     """Lignes de réception"""
     receipt = models.ForeignKey(
-        'PurchaseReceipt', on_delete=models.CASCADE, related_name='items')
-    order_item = models.ForeignKey(PurchaseOrderItem, on_delete=models.CASCADE)
+        PurchaseReceipt, on_delete=models.CASCADE, related_name='items')
+    order_item = models.ForeignKey('PurchaseOrderItem', on_delete=models.CASCADE)
 
     quantity = models.IntegerField(validators=[MinValueValidator(1)])
 
@@ -507,18 +534,11 @@ class PurchaseReceiptItem(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     def save(self, *args, **kwargs):
-        # ✅ Validation : la quantité ne doit pas dépasser le reste
         if self.quantity > self.order_item.remaining_quantity:
             raise ValidationError(
                 f"La quantité reçue ({self.quantity}) dépasse la quantité restante ({self.order_item.remaining_quantity})"
             )
-        
         super().save(*args, **kwargs)
-        
-        # ✅ NE PAS mettre à jour ici - La mise à jour est faite dans le serializer
-        # pour éviter le double comptage
-        # La mise à jour est maintenant gérée dans le serializer
-
 # ============= NOUVEAUX MODÈLES POUR LES FRAIS RÉELS =============
 
 class Transporter(models.Model):
@@ -808,3 +828,622 @@ class PurchaseAlert(models.Model):
 
     def __str__(self):
         return f"{self.get_alert_type_display()} - {self.product.name}"
+# purchases/models.py - Ajoutez ces modèles
+
+from django.db import models
+from django.core.validators import MinValueValidator, MaxValueValidator
+from django.core.exceptions import ValidationError
+from django.utils import timezone
+from decimal import Decimal
+from users.models import CustomUser, Agence
+from produits.models import Product, ProductVariant
+
+# purchases/models.py - Modèle Invoice COMPLET
+
+class Invoice(models.Model):
+    """Facture fournisseur"""
+    
+    INVOICE_STATUS = (
+        ('draft', 'Brouillon'),
+        ('pending', 'En attente de paiement'),
+        ('partial', 'Partiellement payée'),
+        ('paid', 'Payée'),
+        ('overdue', 'En retard'),
+        ('cancelled', 'Annulée'),
+    )
+    
+    INVOICE_TYPE = (
+        ('purchase', "Facture d'achat"),
+        ('service', 'Facture de service'),
+        ('expense', 'Facture de dépense'),
+    )
+    
+    # Références
+    invoice_number = models.CharField(
+        max_length=50,
+        unique=True,
+        verbose_name="N° Facture"
+    )
+    supplier_reference = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+        verbose_name="Réf. fournisseur"
+    )
+    
+    # Relations
+    agence = models.ForeignKey(
+        Agence,
+        on_delete=models.PROTECT,
+        related_name='invoices',
+        verbose_name="Agence"
+    )
+    
+    supplier = models.ForeignKey(
+        'Supplier',
+        on_delete=models.PROTECT,
+        related_name='invoices',
+        verbose_name="Fournisseur"
+    )
+    
+    purchase_receipt = models.ForeignKey(
+        'PurchaseReceipt',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='invoices',
+        verbose_name="Réception associée"
+    )
+    
+    purchase_order = models.ForeignKey(
+        'PurchaseOrder',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='invoices',
+        verbose_name="Commande associée"
+    )
+    
+    created_by = models.ForeignKey(
+        CustomUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name='created_invoices'
+    )
+    
+    validated_by = models.ForeignKey(
+        CustomUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='validated_invoices'
+    )
+    
+    # Dates
+    invoice_date = models.DateField(
+        verbose_name="Date de facture",
+        default=timezone.now
+    )
+    due_date = models.DateField(
+        verbose_name="Date d'échéance"
+    )
+    payment_date = models.DateField(
+        null=True,
+        blank=True,
+        verbose_name="Date de paiement"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    # Montants
+    subtotal = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Sous-total"
+    )
+    tax_total = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Total TVA"
+    )
+    discount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Remise"
+    )
+    shipping_cost = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Frais de livraison"
+    )
+    total = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Total"
+    )
+    amount_paid = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Montant payé"
+    )
+    amount_remaining = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        verbose_name="Montant restant"
+    )
+    
+    currency = models.CharField(
+        max_length=10,
+        default='XOF',
+        verbose_name="Devise"
+    )
+    exchange_rate = models.DecimalField(
+        max_digits=10,
+        decimal_places=4,
+        default=1.0,
+        verbose_name="Taux de change"
+    )
+    
+    # Statuts
+    status = models.CharField(
+        max_length=20,
+        choices=INVOICE_STATUS,
+        default='pending',
+        verbose_name="Statut"
+    )
+    invoice_type = models.CharField(
+        max_length=20,
+        choices=INVOICE_TYPE,
+        default='purchase',
+        verbose_name="Type de facture"
+    )
+    
+    # Documents
+    invoice_file = models.FileField(
+        upload_to='invoices/',
+        null=True,
+        blank=True,
+        verbose_name="Fichier facture"
+    )
+    
+    # Notes
+    notes = models.TextField(
+        blank=True,
+        null=True,
+        verbose_name="Notes"
+    )
+    internal_notes = models.TextField(
+        blank=True,
+        null=True,
+        verbose_name="Notes internes"
+    )
+    
+    # Métadonnées
+    is_auto_generated = models.BooleanField(
+        default=True,
+        verbose_name="Générée automatiquement"
+    )
+    is_active = models.BooleanField(
+        default=True,
+        verbose_name="Active"
+    )
+    
+    class Meta:
+        ordering = ['-invoice_date', '-invoice_number']
+        indexes = [
+            models.Index(fields=['invoice_number']),
+            models.Index(fields=['supplier', 'status']),
+            models.Index(fields=['due_date']),
+            models.Index(fields=['agence']),
+        ]
+        verbose_name = "Facture"
+        verbose_name_plural = "Factures"
+    
+    def __str__(self):
+        return f"{self.invoice_number} - {self.supplier.company_name} - {self.status}"
+    
+    def save(self, *args, **kwargs):
+        # Générer le numéro de facture si non défini
+        if not self.invoice_number:
+            last_invoice = Invoice.objects.order_by('-id').first()
+            if last_invoice:
+                try:
+                    last_num = int(last_invoice.invoice_number.replace('INV', ''))
+                    self.invoice_number = f"INV{str(last_num + 1).zfill(6)}"
+                except (ValueError, AttributeError):
+                    self.invoice_number = "INV000001"
+            else:
+                self.invoice_number = "INV000001"
+        
+        # Mettre à jour le montant restant
+        self.amount_remaining = self.total - self.amount_paid
+        
+        # Mettre à jour le statut automatiquement
+        if self.amount_paid >= self.total and self.total > 0:
+            self.status = 'paid'
+            if not self.payment_date:
+                self.payment_date = timezone.now().date()
+        elif self.amount_paid > 0:
+            self.status = 'partial'
+        elif self.due_date and self.due_date < timezone.now().date() and self.amount_paid < self.total:
+            self.status = 'overdue'
+        elif self.status not in ['draft', 'cancelled']:
+            self.status = 'pending'
+        
+        super().save(*args, **kwargs)
+    
+    @property
+    def is_fully_paid(self):
+        """Vérifie si la facture est entièrement payée"""
+        return self.amount_paid >= self.total
+    
+    @property
+    def payment_progress(self):
+        """Pourcentage de paiement"""
+        if self.total == 0:
+            return 0
+        return round((self.amount_paid / self.total) * 100, 2)
+    
+    @property
+    def is_overdue(self):
+        """Vérifie si la facture est en retard"""
+        return self.due_date < timezone.now().date() and not self.is_fully_paid
+    
+    def create_payment(self, amount, payment_method, **kwargs):
+        """
+        Crée un paiement pour cette facture
+        """
+        if amount <= 0:
+            raise ValidationError("Le montant du paiement doit être supérieur à 0")
+        
+        if amount > self.amount_remaining:
+            raise ValidationError(
+                f"Le montant ({amount}) dépasse le montant restant ({self.amount_remaining})"
+            )
+        
+        payment = Payment.objects.create(
+            invoice=self,
+            amount=amount,
+            payment_method=payment_method,
+            **kwargs
+        )
+        
+        self.amount_paid += amount
+        self.save()
+        
+        return payment
+    
+    def get_items_total(self):
+        """Calcule le total des lignes de facture"""
+        return self.items.aggregate(total=models.Sum('total'))['total'] or 0
+
+class Payment(models.Model):
+    """Paiement d'une facture"""
+    
+    PAYMENT_METHOD = (
+        ('cash', 'Espèces'),
+        ('bank_transfer', 'Virement bancaire'),
+        ('check', 'Chèque'),
+        ('card', 'Carte bancaire'),
+        ('mobile_money', 'Mobile Money'),
+        ('other', 'Autre'),
+    )
+    
+    PAYMENT_STATUS = (
+        ('pending', 'En attente'),
+        ('processing', 'En cours'),
+        ('completed', 'Terminé'),
+        ('failed', 'Échoué'),
+        ('cancelled', 'Annulé'),
+    )
+    
+    # Références
+    payment_number = models.CharField(max_length=50, unique=True, verbose_name="N° Paiement")
+    reference_number = models.CharField(
+        max_length=100, 
+        blank=True, 
+        null=True,
+        verbose_name="N° de référence"
+    )
+    
+    # Relations
+    invoice = models.ForeignKey(
+        Invoice,
+        on_delete=models.CASCADE,
+        related_name='payments',
+        verbose_name="Facture"
+    )
+    
+    agence = models.ForeignKey(
+        Agence,
+        on_delete=models.PROTECT,
+        related_name='payments'
+    )
+    
+    created_by = models.ForeignKey(
+        CustomUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name='created_payments'
+    )
+    
+    validated_by = models.ForeignKey(
+        CustomUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='validated_payments'
+    )
+    
+    # ✅ Lien vers la trésorerie
+    caisse = models.ForeignKey(
+        'tresorerie.Caisse',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='payments',
+        verbose_name="Caisse utilisée"
+    )
+    
+    compte_bancaire = models.ForeignKey(
+        'tresorerie.CompteBancaire',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='payments',
+        verbose_name="Compte bancaire utilisé"
+    )
+    
+    mouvement_tresorerie = models.ForeignKey(
+        'tresorerie.MouvementTresorerie',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='payment',
+        verbose_name="Mouvement de trésorerie"
+    )
+    
+    # Montants
+    amount = models.DecimalField(
+        max_digits=12, 
+        decimal_places=2,
+        validators=[MinValueValidator(0.01)]
+    )
+    
+    currency = models.CharField(max_length=10, default='XOF')
+    exchange_rate = models.DecimalField(max_digits=10, decimal_places=4, default=1.0)
+    
+    # Dates
+    payment_date = models.DateField(default=timezone.now)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    # Méthode et statut
+    payment_method = models.CharField(max_length=20, choices=PAYMENT_METHOD)
+    status = models.CharField(max_length=20, choices=PAYMENT_STATUS, default='completed')
+    
+    # Notes
+    notes = models.TextField(blank=True, null=True)
+    
+    # Documents
+    receipt_file = models.FileField(
+        upload_to='payments/',
+        null=True,
+        blank=True,
+        verbose_name="Reçu"
+    )
+    
+    class Meta:
+        ordering = ['-payment_date', '-payment_number']
+        indexes = [
+            models.Index(fields=['payment_number']),
+            models.Index(fields=['invoice', 'status']),
+            models.Index(fields=['payment_date']),
+        ]
+        verbose_name = "Paiement"
+        verbose_name_plural = "Paiements"
+    
+    def __str__(self):
+        return f"{self.payment_number} - {self.invoice.invoice_number} - {self.amount}"
+    
+    def save(self, *args, **kwargs):
+        if not self.payment_number:
+            last_payment = Payment.objects.order_by('-id').first()
+            if last_payment:
+                try:
+                    last_num = int(last_payment.payment_number.replace('PAY', ''))
+                    self.payment_number = f"PAY{str(last_num + 1).zfill(6)}"
+                except (ValueError, AttributeError):
+                    self.payment_number = "PAY000001"
+            else:
+                self.payment_number = "PAY000001"
+        
+        super().save(*args, **kwargs)
+        
+        # Mettre à jour le montant payé de la facture
+        if self.status == 'completed':
+            self.invoice.amount_paid = Payment.objects.filter(
+                invoice=self.invoice,
+                status='completed'
+            ).aggregate(total=models.Sum('amount'))['total'] or 0
+            self.invoice.save()
+    
+    def create_treasury_movement(self):
+        """Crée un mouvement de trésorerie pour ce paiement"""
+        from tresorerie.models import MouvementTresorerie
+        
+        if self.mouvement_tresorerie:
+            return self.mouvement_tresorerie
+        
+        mouvement = MouvementTresorerie.objects.create(
+            type_mouvement='decaissement',
+            agence=self.agence,
+            source_type='payment',
+            source_id=self.id,
+            source_reference=self.payment_number,
+            montant=self.amount,
+            mode_paiement=self.payment_method,
+            caisse=self.caisse,
+            compte_bancaire=self.compte_bancaire,
+            date_mouvement=timezone.now(),
+            date_valeur=self.payment_date,
+            status='effectue',
+            libelle=f"Paiement facture {self.invoice.invoice_number} - {self.payment_number}",
+            created_by=self.created_by
+        )
+        
+        self.mouvement_tresorerie = mouvement
+        self.save(update_fields=['mouvement_tresorerie'])
+        return mouvement
+
+
+# purchases/models.py - Modèle InvoiceItem COMPLET
+# purchases/models.py - InvoiceItem
+
+class InvoiceItem(models.Model):
+    """Lignes de facture"""
+    
+    invoice = models.ForeignKey(
+        Invoice,
+        on_delete=models.CASCADE,
+        related_name='items',
+        verbose_name="Facture"
+    )
+    
+    receipt_item = models.ForeignKey(
+        'PurchaseReceiptItem',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='invoice_items',
+        verbose_name="Ligne de réception"
+    )
+    
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        verbose_name="Produit"
+    )
+    
+    variant = models.ForeignKey(
+        ProductVariant,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        verbose_name="Variante"
+    )
+    
+    description = models.CharField(
+        max_length=255,
+        verbose_name="Description"
+    )
+    
+    quantity = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=1,
+        validators=[MinValueValidator(0.01)],
+        verbose_name="Quantité"
+    )
+    
+    unit_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        validators=[MinValueValidator(0)],
+        verbose_name="Prix unitaire"
+    )
+    
+    discount_rate = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=0,
+        validators=[MinValueValidator(0), MaxValueValidator(100)],
+        verbose_name="Taux de remise (%)"
+    )
+    
+    tax_rate = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=0,  # ✅ Mettre 0 par défaut pour correspondre au total de la réception
+        validators=[MinValueValidator(0), MaxValueValidator(100)],
+        verbose_name="Taux de TVA (%)"
+    )
+    
+    subtotal = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        editable=False,
+        default=0,
+        verbose_name="Sous-total"
+    )
+    
+    tax_amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        editable=False,
+        default=0,
+        verbose_name="Montant TVA"
+    )
+    
+    total = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        editable=False,
+        default=0,
+        verbose_name="Total"
+    )
+    
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+        verbose_name="Créé le"
+    )
+    
+    updated_at = models.DateTimeField(
+        auto_now=True,
+        verbose_name="Modifié le"
+    )
+    
+    class Meta:
+        ordering = ['id']
+        verbose_name = "Ligne de facture"
+        verbose_name_plural = "Lignes de facture"
+        indexes = [
+            models.Index(fields=['invoice']),
+            models.Index(fields=['product']),
+        ]
+    
+    def __str__(self):
+        return f"{self.invoice.invoice_number} - {self.description} - {self.total} FCFA"
+    
+    def save(self, *args, **kwargs):
+        """
+        Calcule automatiquement les montants avant la sauvegarde
+        """
+        from decimal import Decimal
+        
+        qty = Decimal(str(self.quantity))
+        unit_price = Decimal(str(self.unit_price))
+        disc_rate = Decimal(str(self.discount_rate))
+        tax_rate = Decimal(str(self.tax_rate))
+        
+        # Calcul du sous-total avec remise
+        discount_factor = (Decimal('100') - disc_rate) / Decimal('100')
+        self.subtotal = qty * unit_price * discount_factor
+        
+        # Calcul de la TVA
+        tax_factor = tax_rate / Decimal('100')
+        self.tax_amount = self.subtotal * tax_factor
+        
+        # Calcul du total
+        self.total = self.subtotal + self.tax_amount
+        
+        super().save(*args, **kwargs)
