@@ -847,8 +847,13 @@ class InvoiceCreateSerializer(serializers.ModelSerializer):
         invoice.save()
         
         return invoice
+# purchases/serializers.py
 
 class PaymentCreateSerializer(serializers.ModelSerializer):
+    """
+    Serializer pour la création d'un paiement
+    """
+    
     class Meta:
         model = Payment
         fields = [
@@ -858,47 +863,85 @@ class PaymentCreateSerializer(serializers.ModelSerializer):
         read_only_fields = ('payment_number', 'created_at', 'updated_at')
     
     def validate(self, data):
+        """
+        Validation des données
+        """
         invoice = data.get('invoice')
         amount = data.get('amount')
         
-        if amount > invoice.amount_remaining:
-            raise serializers.ValidationError(
-                f"Le montant ({amount}) dépasse le montant restant ({invoice.amount_remaining})"
-            )
+        # ✅ Vérifier que la facture existe et est valide
+        if not invoice:
+            raise serializers.ValidationError({
+                'invoice': 'La facture est obligatoire'
+            })
         
-        # Vérifier qu'une destination est spécifiée
+        # ✅ Vérifier que le montant est valide
+        if amount <= 0:
+            raise serializers.ValidationError({
+                'amount': 'Le montant doit être supérieur à 0'
+            })
+        
+        # ✅ Vérifier que le montant ne dépasse pas le montant restant
+        if amount > invoice.amount_remaining:
+            raise serializers.ValidationError({
+                'amount': f"Le montant ({amount}) dépasse le montant restant ({invoice.amount_remaining})"
+            })
+        
+        # ✅ Vérifier qu'une destination est spécifiée
         caisse = data.get('caisse')
         compte = data.get('compte_bancaire')
         
         if not caisse and not compte:
-            raise serializers.ValidationError(
-                "Veuillez spécifier une caisse ou un compte bancaire"
-            )
+            raise serializers.ValidationError({
+                'caisse': 'Veuillez spécifier une caisse ou un compte bancaire'
+            })
         
         if caisse and compte:
-            raise serializers.ValidationError(
-                "Veuillez choisir une seule destination (caisse ou compte)"
-            )
+            raise serializers.ValidationError({
+                'caisse': 'Veuillez choisir une seule destination (caisse ou compte)'
+            })
+        
+        # ✅ Vérifier que la destination appartient à la même agence
+        if caisse and caisse.agence != invoice.agence:
+            raise serializers.ValidationError({
+                'caisse': 'La caisse doit appartenir à la même agence que la facture'
+            })
+        
+        if compte and compte.agence != invoice.agence:
+            raise serializers.ValidationError({
+                'compte_bancaire': 'Le compte bancaire doit appartenir à la même agence que la facture'
+            })
         
         return data
     
     def create(self, validated_data):
+        """
+        Création d'un paiement
+        """
         invoice = validated_data.get('invoice')
         amount = validated_data.get('amount')
+        request = self.context.get('request')
         
-        # Créer le paiement
+        # ✅ Récupérer l'agence depuis la facture
+        agence = invoice.agence
+        
+        # ✅ Créer le paiement
         payment = Payment.objects.create(
-            **validated_data,
-            payment_number=f"PAY{str(Payment.objects.count() + 1).zfill(6)}",
-            created_by=self.context['request'].user,
+            invoice=invoice,
+            agence=agence,
+            amount=amount,
+            payment_method=validated_data.get('payment_method', 'bank_transfer'),
+            payment_date=validated_data.get('payment_date', timezone.now().date()),
+            caisse=validated_data.get('caisse'),
+            compte_bancaire=validated_data.get('compte_bancaire'),
+            reference_number=validated_data.get('reference_number', ''),
+            notes=validated_data.get('notes', ''),
+            created_by=request.user if request else None,
             status='completed'
         )
         
-        # Mettre à jour la facture
-        invoice.amount_paid += amount
-        invoice.save()
-        
-        # Créer le mouvement de trésorerie
-        payment.create_treasury_movement()
+        # ✅ La méthode save() du Payment va automatiquement :
+        # 1. Mettre à jour le montant payé de la facture
+        # 2. Créer le mouvement de trésorerie via create_treasury_movement()
         
         return payment
