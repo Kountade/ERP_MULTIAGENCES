@@ -164,6 +164,9 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
+
+# Static files (CSS, JavaScript, Images)
+# https://docs.djangoproject.com/en/5.2/howto/static-files/
 STATIC_URL = '/static/'
 # Dossier pour les fichiers statiques en développement
 STATICFILES_DIRS = [os.path.join(BASE_DIR, 'static')]
@@ -180,4 +183,5 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'media/')
 # Configuration pour les images (optionnel)
 IMAGE_MAX_SIZE = (800, 800)  # Taille max des images
 THUMBNAIL_SIZE = (150, 150)  # Taille des miniatures
+
 
