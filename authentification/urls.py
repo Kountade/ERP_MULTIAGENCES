@@ -10,9 +10,10 @@ urlpatterns = [
     path('', include('produits.urls')),
     path('', include('inventaire.urls')),
     path('', include('sales.urls')),
+    path('', include('purchases.urls')),
     path('', include('comptabilite.urls')),
     path('', include('tresorerie.urls')),
-    path('', include('purchases.urls')),
+    path('', include('hr.urls')),
     path('', include('dashboard.urls')),
 
 

@@ -1,7 +1,9 @@
-from django.contrib.auth import get_user_model
+# hr/views.py - Version corrigée complète avec gestion des doublons
+
+import os
 import logging
-from django.core.exceptions import PermissionDenied
-from django.shortcuts import get_object_or_404
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.contrib.auth import get_user_model
 from rest_framework import viewsets, permissions, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -15,6 +17,9 @@ from django.core.files.base import ContentFile
 import qrcode
 from io import BytesIO
 import json
+
+logger = logging.getLogger(__name__)
+CustomUser = get_user_model()
 
 
 class DepartmentViewset(viewsets.ModelViewSet):
@@ -67,7 +72,6 @@ class EmployeeViewset(viewsets.ModelViewSet):
             employee.generate_qr_code()
             employee.save()
 
-        # Construire l'URL absolue
         qr_absolute_url = None
         if employee.qr_code and employee.qr_code.url:
             qr_absolute_url = request.build_absolute_uri(employee.qr_code.url)
@@ -126,35 +130,118 @@ class LeaveViewset(viewsets.ModelViewSet):
             return LeaveCreateSerializer
         return LeaveSerializer
 
+    def _generate_unique_employee_number(self):
+        """Génère un numéro d'employé unique"""
+        last_employee = Employee.objects.order_by('-id').first()
+        if last_employee:
+            try:
+                # Extraire le numéro numérique du dernier employee_number
+                last_num = int(''.join(filter(str.isdigit, last_employee.employee_number)) or '0')
+                new_num = last_num + 1
+            except (ValueError, TypeError):
+                new_num = Employee.objects.count() + 1
+        else:
+            new_num = 1
+        
+        # S'assurer que le numéro est unique
+        while True:
+            employee_number = f"EMP{str(new_num).zfill(6)}"
+            if not Employee.objects.filter(employee_number=employee_number).exists():
+                return employee_number
+            new_num += 1
+
+    def _get_or_create_employee(self, user):
+        """
+        Récupère ou crée un profil Employee pour l'utilisateur
+        """
+        try:
+            employee = Employee.objects.get(user=user)
+            logger.info(f"✅ Employee trouvé: {employee.employee_number} - {user.email}")
+            return employee
+        except Employee.DoesNotExist:
+            logger.info(f"⚠️ Création automatique d'un Employee pour {user.email}")
+            
+            # Générer un numéro d'employé unique
+            employee_number = self._generate_unique_employee_number()
+            
+            try:
+                employee = Employee.objects.create(
+                    user=user,
+                    employee_number=employee_number,
+                    hire_date=timezone.now().date(),
+                    contract_type='cdi',
+                    base_salary=0,
+                    emergency_contact_name=user.get_full_name() or user.email or 'À définir',
+                    emergency_contact_phone='À définir',
+                    emergency_contact_relation='À définir',
+                )
+                logger.info(f"✅ Employee créé: {employee.employee_number} - {user.email}")
+                return employee
+            except Exception as e:
+                logger.error(f"❌ Erreur lors de la création de l'Employee: {e}")
+                raise
+
     @action(detail=True, methods=['post'])
     def approve(self, request, pk=None):
         """Approuver une demande de congé"""
         leave = self.get_object()
+        
         if leave.status != 'pending':
-            return Response({'error': 'Cette demande a déjà été traitée'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'error': 'Cette demande a déjà été traitée'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
+        try:
+            employee = self._get_or_create_employee(request.user)
+        except Exception as e:
+            logger.error(f"❌ Erreur lors de la récupération/création de l'Employee: {e}")
+            return Response(
+                {'error': 'Impossible de trouver ou créer votre profil employé. Contactez le RH.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
         leave.status = 'approved'
-        leave.approved_by = Employee.objects.get(user=request.user)
+        leave.approved_by = employee
         leave.approval_date = timezone.now()
         leave.approval_comments = request.data.get('comments', '')
         leave.save()
 
-        return Response({'message': 'Demande approuvée avec succès'})
+        return Response({
+            'message': 'Demande approuvée avec succès',
+            'approved_by': employee.full_name
+        })
 
     @action(detail=True, methods=['post'])
     def reject(self, request, pk=None):
         """Rejeter une demande de congé"""
         leave = self.get_object()
+        
         if leave.status != 'pending':
-            return Response({'error': 'Cette demande a déjà été traitée'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {'error': 'Cette demande a déjà été traitée'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
+        try:
+            employee = self._get_or_create_employee(request.user)
+        except Exception as e:
+            logger.error(f"❌ Erreur lors de la récupération/création de l'Employee: {e}")
+            return Response(
+                {'error': 'Impossible de trouver ou créer votre profil employé. Contactez le RH.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
         leave.status = 'rejected'
-        leave.approved_by = Employee.objects.get(user=request.user)
+        leave.approved_by = employee
         leave.approval_date = timezone.now()
         leave.approval_comments = request.data.get('comments', '')
         leave.save()
 
-        return Response({'message': 'Demande rejetée'})
+        return Response({
+            'message': 'Demande rejetée',
+            'rejected_by': employee.full_name
+        })
 
     @action(detail=False, methods=['get'])
     def pending(self, request):
@@ -198,7 +285,6 @@ class AttendanceViewset(viewsets.ModelViewSet):
         employee_id = data.get('employee_id')
         method = data.get('method', 'manual')
 
-        # Récupérer l'employé
         if qr_token:
             employee = Employee.objects.filter(qr_code_token=qr_token).first()
         elif employee_id:
@@ -419,21 +505,6 @@ class PerformanceReviewViewset(viewsets.ModelViewSet):
     ordering_fields = ['review_date']
 
 
-# views.py - ExpenseClaimViewset COMPLET
-
-
-logger = logging.getLogger(__name__)
-
-# hr/views.py - ExpenseClaimViewset (sans employee)
-# hr/views.py - ExpenseClaimViewset SANS employee
-
-# hr/views.py - ExpenseClaimViewset avec création automatique
-
-
-CustomUser = get_user_model()
-logger = logging.getLogger(__name__)
-
-
 class ExpenseClaimViewset(viewsets.ModelViewSet):
     """
     Viewset pour les notes de frais
@@ -462,43 +533,53 @@ class ExpenseClaimViewset(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save()
 
-    # ============================================
-    # 🔧 FONCTION UTILITAIRE - Récupérer ou créer un Employee
-    # ============================================
+    def _generate_unique_employee_number(self):
+        """Génère un numéro d'employé unique"""
+        last_employee = Employee.objects.order_by('-id').first()
+        if last_employee:
+            try:
+                last_num = int(''.join(filter(str.isdigit, last_employee.employee_number)) or '0')
+                new_num = last_num + 1
+            except (ValueError, TypeError):
+                new_num = Employee.objects.count() + 1
+        else:
+            new_num = 1
+        
+        while True:
+            employee_number = f"EMP{str(new_num).zfill(6)}"
+            if not Employee.objects.filter(employee_number=employee_number).exists():
+                return employee_number
+            new_num += 1
 
     def _get_or_create_employee(self, user):
         """
         Récupère ou crée un profil Employee pour l'utilisateur
         """
         try:
-            # Essayer de récupérer l'Employee existant
             employee = Employee.objects.get(user=user)
-            logger.info(
-                f"✅ Employee trouvé: {employee.employee_number} - {user.email}")
+            logger.info(f"✅ Employee trouvé: {employee.employee_number} - {user.email}")
             return employee
         except Employee.DoesNotExist:
-            # Créer un Employee automatiquement
-            logger.info(
-                f"⚠️ Création automatique d'un Employee pour {user.email}")
-
-            employee = Employee.objects.create(
-                user=user,
-                employee_number=f"EMP{user.id:06d}",
-                hire_date=timezone.now().date(),
-                contract_type='cdi',
-                base_salary=0,
-                emergency_contact_name=user.get_full_name() or user.email or 'À définir',
-                emergency_contact_phone='À définir',
-                emergency_contact_relation='À définir',
-            )
-
-            logger.info(
-                f"✅ Employee créé: {employee.employee_number} - {user.email}")
-            return employee
-
-    # ============================================
-    # 🔥 VALIDATION RH
-    # ============================================
+            logger.info(f"⚠️ Création automatique d'un Employee pour {user.email}")
+            
+            employee_number = self._generate_unique_employee_number()
+            
+            try:
+                employee = Employee.objects.create(
+                    user=user,
+                    employee_number=employee_number,
+                    hire_date=timezone.now().date(),
+                    contract_type='cdi',
+                    base_salary=0,
+                    emergency_contact_name=user.get_full_name() or user.email or 'À définir',
+                    emergency_contact_phone='À définir',
+                    emergency_contact_relation='À définir',
+                )
+                logger.info(f"✅ Employee créé: {employee.employee_number} - {user.email}")
+                return employee
+            except Exception as e:
+                logger.error(f"❌ Erreur lors de la création de l'Employee: {e}")
+                raise
 
     @action(detail=True, methods=['post'])
     def validate(self, request, pk=None):
@@ -518,12 +599,10 @@ class ExpenseClaimViewset(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # ✅ Récupérer ou créer l'Employee pour l'utilisateur connecté
         try:
             employee = self._get_or_create_employee(user)
         except Exception as e:
-            logger.error(
-                f"❌ Erreur lors de la récupération/création de l'Employee: {e}")
+            logger.error(f"❌ Erreur lors de la récupération/création de l'Employee: {e}")
             return Response(
                 {'error': 'Impossible de trouver ou créer votre profil employé. Contactez le RH.'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -539,10 +618,6 @@ class ExpenseClaimViewset(viewsets.ModelViewSet):
             'message': '✅ Note validée avec succès',
             'expense': ExpenseClaimSerializer(expense).data
         })
-
-    # ============================================
-    # 🔥 PAIEMENT COMPTABLE
-    # ============================================
 
     @action(detail=True, methods=['post'])
     def pay(self, request, pk=None):
@@ -562,12 +637,10 @@ class ExpenseClaimViewset(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # ✅ Récupérer ou créer l'Employee pour l'utilisateur connecté
         try:
             employee = self._get_or_create_employee(user)
         except Exception as e:
-            logger.error(
-                f"❌ Erreur lors de la récupération/création de l'Employee: {e}")
+            logger.error(f"❌ Erreur lors de la récupération/création de l'Employee: {e}")
             return Response(
                 {'error': 'Impossible de trouver ou créer votre profil employé. Contactez le RH.'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -583,10 +656,6 @@ class ExpenseClaimViewset(viewsets.ModelViewSet):
             'message': '✅ Paiement approuvé avec succès',
             'expense': ExpenseClaimSerializer(expense).data
         })
-
-    # ============================================
-    # 🔥 REJET
-    # ============================================
 
     @action(detail=True, methods=['post'])
     def reject(self, request, pk=None):
@@ -606,12 +675,10 @@ class ExpenseClaimViewset(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # ✅ Récupérer ou créer l'Employee pour l'utilisateur connecté
         try:
             employee = self._get_or_create_employee(user)
         except Exception as e:
-            logger.error(
-                f"❌ Erreur lors de la récupération/création de l'Employee: {e}")
+            logger.error(f"❌ Erreur lors de la récupération/création de l'Employee: {e}")
             return Response(
                 {'error': 'Impossible de trouver ou créer votre profil employé. Contactez le RH.'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -627,10 +694,6 @@ class ExpenseClaimViewset(viewsets.ModelViewSet):
             'message': '❌ Note rejetée',
             'expense': ExpenseClaimSerializer(expense).data
         })
-
-    # ============================================
-    # 🔥 ANNULATION
-    # ============================================
 
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
@@ -651,9 +714,56 @@ class ExpenseClaimViewset(viewsets.ModelViewSet):
             'expense': ExpenseClaimSerializer(expense).data
         })
 
-    # ============================================
-    # 🔒 FONCTIONS DE PERMISSION
-    # ============================================
+    @action(detail=False, methods=['get'])
+    def dashboard_stats(self, request):
+        """Statistiques avancées pour le dashboard"""
+        user = request.user
+        queryset = self.get_queryset()
+
+        year = request.query_params.get('year', timezone.now().year)
+        try:
+            year = int(year)
+            queryset = queryset.filter(date__year=year)
+        except ValueError:
+            pass
+
+        monthly_stats = queryset.extra(
+            select={'month': "EXTRACT(month FROM date)"}
+        ).values('month').annotate(
+            total_amount=Sum('amount'),
+            count=Count('id')
+        ).order_by('month')
+
+        top_expenses = queryset.values('expense_type').annotate(
+            total=Sum('amount'),
+            count=Count('id')
+        ).order_by('-total')[:5]
+
+        approved_expenses = queryset.filter(
+            status='approved',
+            validation_date__isnull=False
+        )
+        avg_processing_time = approved_expenses.aggregate(
+            avg_days=Avg(
+                models.ExpressionWrapper(
+                    models.F('validation_date') - models.F('created_at'),
+                    output_field=models.DurationField()
+                )
+            )
+        )
+
+        stats = {
+            'year': year,
+            'total_expenses': queryset.count(),
+            'total_amount': queryset.aggregate(total=Sum('amount'))['total'] or 0,
+            'monthly': list(monthly_stats),
+            'top_expense_types': list(top_expenses),
+            'avg_processing_days': avg_processing_time['avg_days'].days if avg_processing_time['avg_days'] else 0,
+            'pending_count': queryset.filter(status='pending').count(),
+            'pending_amount': queryset.filter(status='pending').aggregate(total=Sum('amount'))['total'] or 0,
+        }
+
+        return Response(stats)
 
     def _is_comptable(self, user):
         """Vérifie si l'utilisateur est comptable"""
@@ -677,106 +787,6 @@ class ExpenseClaimViewset(viewsets.ModelViewSet):
         if user.role_global in ['pdg', 'drh']:
             return True
         return self._is_comptable(user)
-# ============================================
-
-
-class ExpenseClaimSerializer(serializers.ModelSerializer):
-    employee_name = serializers.CharField(
-        source='employee.full_name', read_only=True)
-    expense_type_display = serializers.CharField(
-        source='get_expense_type_display', read_only=True)
-    status_display = serializers.CharField(
-        source='get_status_display', read_only=True)
-    approved_by_name = serializers.CharField(
-        source='approved_by.full_name', read_only=True)
-    amount_formatted = serializers.SerializerMethodField()
-
-    class Meta:
-        model = ExpenseClaim
-        fields = '__all__'
-        read_only_fields = ('created_at', 'updated_at',
-                            'approval_date', 'payment_date')
-
-    def get_amount_formatted(self, obj):
-        """Formatage du montant avec séparateur d'espace"""
-        if obj.amount:
-            return f"{int(obj.amount):,}".replace(',', ' ') + ' GNF'
-        return '0 GNF'
-
-    def validate(self, data):
-        """Validation personnalisée"""
-        # Vérifier que la date n'est pas dans le futur
-        if data.get('date') and data['date'] > timezone.now().date():
-            raise serializers.ValidationError(
-                "La date de la dépense ne peut pas être dans le futur"
-            )
-
-        # Vérifier que le montant est positif
-        if data.get('amount') and data['amount'] <= 0:
-            raise serializers.ValidationError(
-                "Le montant doit être supérieur à 0"
-            )
-
-        return data
-
-
-# ============================================
-
-
-@action(detail=False, methods=['get'])
-def dashboard_stats(self, request):
-    """Statistiques avancées pour le dashboard"""
-    user = request.user
-    queryset = self.get_queryset()
-
-    # Filtrer par année
-    year = request.query_params.get('year', timezone.now().year)
-    try:
-        year = int(year)
-        queryset = queryset.filter(date__year=year)
-    except ValueError:
-        pass
-
-    # Statistiques mensuelles
-    monthly_stats = queryset.extra(
-        select={'month': "EXTRACT(month FROM date)"}
-    ).values('month').annotate(
-        total_amount=Sum('amount'),
-        count=Count('id')
-    ).order_by('month')
-
-    # Top des types de dépenses
-    top_expenses = queryset.values('expense_type').annotate(
-        total=Sum('amount'),
-        count=Count('id')
-    ).order_by('-total')[:5]
-
-    # Délai moyen de traitement (approuvées)
-    approved_expenses = queryset.filter(
-        status='approved',
-        approval_date__isnull=False
-    )
-    avg_processing_time = approved_expenses.aggregate(
-        avg_days=Avg(
-            models.ExpressionWrapper(
-                models.F('approval_date') - models.F('created_at'),
-                output_field=models.DurationField()
-            )
-        )
-    )
-
-    stats = {
-        'year': year,
-        'total_expenses': queryset.count(),
-        'total_amount': queryset.aggregate(total=Sum('amount'))['total'] or 0,
-        'monthly': list(monthly_stats),
-        'top_expense_types': list(top_expenses),
-        'avg_processing_days': avg_processing_time['avg_days'].days if avg_processing_time['avg_days'] else 0,
-        'pending_count': queryset.filter(status='pending').count(),
-        'pending_amount': queryset.filter(status='pending').aggregate(total=Sum('amount'))['total'] or 0,
-    }
-
-    return Response(stats)
 
 
 class DocumentViewset(viewsets.ModelViewSet):
@@ -801,23 +811,19 @@ class HRStatsViewset(viewsets.GenericViewSet):
     def dashboard(self, request):
         """Statistiques du tableau de bord RH"""
 
-        # Statistiques employés
         total_employees = Employee.objects.count()
         active_employees = Employee.objects.filter(
             work_status='active').count()
         on_leave = Employee.objects.filter(work_status='on_leave').count()
 
-        # Congés en attente
         pending_leaves = Leave.objects.filter(status='pending').count()
 
-        # Présences aujourd'hui
         today = timezone.now().date()
         present_today = Attendance.objects.filter(
             date=today, check_in_time__isnull=False).count()
         absent_today = Attendance.objects.filter(
             date=today, is_absent=True).count()
 
-        # Paie du mois
         now = timezone.now()
         monthly_payroll = Payroll.objects.filter(
             month=now.month,
@@ -825,30 +831,23 @@ class HRStatsViewset(viewsets.GenericViewSet):
             status='approved'
         ).aggregate(total=Sum('net_salary'))['total'] or 0
 
-        # Nouveaux embauches ce mois
         first_day_of_month = datetime(now.year, now.month, 1).date()
         new_hires = Employee.objects.filter(
             hire_date__gte=first_day_of_month).count()
 
-        # Turnover rate
-        # (Calcul simplifié)
         turnover_rate = 0.0
 
-        # Salaire moyen
         avg_salary = Employee.objects.filter(work_status='active').aggregate(
             avg=Avg('base_salary'))['avg'] or 0
 
-        # Distribution par genre
         gender_dist = Employee.objects.values(
             'gender').annotate(count=Count('id'))
         gender_distribution = {item['gender']: item['count'] for item in gender_dist}
 
-        # Distribution par département
         dept_dist = Department.objects.annotate(
             employee_count=Count('employees')
         ).values('name', 'employee_count')
 
-        # Alertes solde congés
         leave_alerts = []
         for employee in Employee.objects.filter(work_status='active'):
             if employee.remaining_leave_days < 5:
