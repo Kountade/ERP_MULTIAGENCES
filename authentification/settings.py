@@ -25,7 +25,12 @@ SECRET_KEY = 'django-insecure-!$c*!zl1od42_l=1p^4e246v9m)b!4s7b!av_lmmr-q33vy9p0
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+
+ALLOWED_HOSTS = ["seydi-group-back.onrender.com",
+                 "localhost", "127.0.0.1"]
+CSRF_TRUSTED_ORIGINS = ['https://erp-multiagences.onrender.com']
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
 
 
 # Application definition
